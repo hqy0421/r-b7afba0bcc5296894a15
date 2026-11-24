@@ -84,8 +84,16 @@ def init_db(db_path: str) -> Session:
             conn.execute(text("ALTER TABLE articles ADD COLUMN embedding_vector TEXT"))
             conn.commit()
 
+    _ensure_vector_index_schema(engine)
+
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal()
+
+
+def _ensure_vector_index_schema(engine) -> None:
+    """Install the vector index generation schema/triggers (idempotent)."""
+    from .vector_index import ensure_schema
+    ensure_schema(engine)
 
 
 def get_db_session(db_path: str) -> Session:

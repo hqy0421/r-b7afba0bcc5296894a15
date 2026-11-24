@@ -122,21 +122,29 @@ Content:
     
     @property
     def annoy_index_path(self) -> str:
-        """Get Annoy index path."""
+        """Get the base path for generation-addressed Annoy index files."""
         path = self.get("annoy", "index_path", "~/.config/rssidian/annoy.idx")
-        expanded_path = os.path.expanduser(path)
-        os.makedirs(os.path.dirname(expanded_path), exist_ok=True)
-        return expanded_path
-    
+        return os.path.abspath(os.path.expanduser(path))
+
     @property
     def annoy_n_trees(self) -> int:
         """Get Annoy n_trees parameter."""
         return self.get("annoy", "n_trees", 10)
-    
+
     @property
     def annoy_metric(self) -> str:
         """Get Annoy metric."""
         return self.get("annoy", "metric", "angular")
+
+    @property
+    def embedding_model_name(self) -> str:
+        """Get the sentence-transformers embedding model name."""
+        return self.get("annoy", "embedding_model", "all-mpnet-base-v2")
+
+    @property
+    def embedding_dim(self) -> int:
+        """Get the embedding vector dimension for the configured model."""
+        return self.get("annoy", "embedding_dim", 768)
     
     @property
     def default_lookback(self) -> int:

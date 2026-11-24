@@ -174,3 +174,7 @@ cython_debug/
 
 # Maestro Auto Run Docs
 Auto Run Docs/
+
+# Generated vector index files
+annoy*.idx
+*.idx.tmp*

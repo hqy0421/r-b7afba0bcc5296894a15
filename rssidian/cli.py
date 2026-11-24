@@ -619,6 +619,12 @@ def ingest(ctx, lookback, debug):
             click.echo(f"Backfilled embeddings: {backfill_result['succeeded']}/{backfill_result['total']} "
                        f"({backfill_result['failed']} failed)")
 
+        # Step 2c: Keep the published vector index consistent with the database.
+        index_result = processor.ensure_index_current()
+        if index_result.get('rebuilt'):
+            click.echo(f"Rebuilt vector index generation {index_result.get('generation')} "
+                       f"({index_result.get('indexed', 0)} vectors).")
+
         # Step 3: Generate digest
         click.echo("Generating digest...")
         lookback_period = lookback or config.default_lookback
@@ -800,8 +806,43 @@ def backfill_embeddings(ctx, batch_size):
         result = processor.backfill_embeddings(batch_size=batch_size)
         click.echo(f"Backfill complete: {result['succeeded']}/{result['total']} articles "
                    f"({result['failed']} failed)")
+        index_result = processor.ensure_index_current()
+        if index_result.get('rebuilt'):
+            click.echo(f"Rebuilt vector index generation {index_result.get('generation')} "
+                       f"({index_result.get('indexed', 0)} vectors).")
     except Exception as e:
         click.echo(f"Error during backfill: {str(e)}", err=True)
+    finally:
+        db_session.close()
+
+
+@cli.command("rebuild-index")
+@click.pass_context
+def rebuild_index(ctx):
+    """Rebuild the vector index from vectors stored in the database.
+
+    Publishes a new index generation tied to the current database contents.
+    Use this after deleting articles, restoring a backup, or whenever search
+    reports that the index is out of sync.
+    """
+    config = ctx.obj["config"]
+    db_session = ensure_db_exists(config)
+
+    from .core import RSSProcessor
+
+    processor = RSSProcessor(config, db_session)
+
+    try:
+        result = processor.rebuild_index()
+        if result.get("published"):
+            click.echo(f"Published vector index generation {result['generation']} "
+                       f"({result['indexed']} vectors, {result['eligible']} eligible).")
+            if result.get("skipped"):
+                click.echo(f"Skipped {result['skipped']} malformed embedding(s).")
+        else:
+            click.echo(f"Failed to publish vector index: {result.get('reason')}", err=True)
+    except Exception as e:
+        click.echo(f"Error rebuilding vector index: {str(e)}", err=True)
     finally:
         db_session.close()
 
@@ -965,17 +1006,40 @@ def show_config(ctx):
         "D": db_session.query(Article).filter_by(quality_tier="D").count(),
     }
     
-    # Get vector index size
+    # Get vector index status (generation-aware)
+    from .vector_index import VectorIndexManager
+
+    index_manager = VectorIndexManager(db_session.get_bind(), config)
+    index_state = index_manager.read_state()
     vector_index_size_bytes = 0
     vector_index_size_human = "Not found"
-    if os.path.exists(config.annoy_index_path):
-        vector_index_size_bytes = os.path.getsize(config.annoy_index_path)
+    if index_state and index_manager.is_current(index_state):
+        index_status = "committed / current"
+    elif index_state and index_state.get("status") == "committed":
+        index_status = "stale (run 'rssidian rebuild-index')"
+    elif index_state:
+        index_status = "uninitialized (run 'rssidian rebuild-index')"
+    else:
+        index_status = "not initialized (run 'rssidian rebuild-index')"
+
+    indexed_file = None
+    if index_state:
+        indexed_file = index_manager._file_path(index_state)
+    if indexed_file and os.path.exists(indexed_file):
+        vector_index_size_bytes = os.path.getsize(indexed_file)
         # Convert to human-readable format
         for unit in ['B', 'KB', 'MB', 'GB']:
             if vector_index_size_bytes < 1024.0 or unit == 'GB':
                 vector_index_size_human = f"{vector_index_size_bytes:.2f} {unit}"
                 break
             vector_index_size_bytes /= 1024.0
+
+    legacy_index_note = ""
+    legacy_path = config.annoy_index_path
+    if os.path.exists(legacy_path) and (
+        not indexed_file or os.path.abspath(legacy_path) != os.path.abspath(indexed_file)
+    ):
+        legacy_index_note = " (legacy file ignored)"
     
     # Configuration info
     console.print(Panel.fit(
@@ -990,7 +1054,18 @@ def show_config(ctx):
     config_table.add_row("Config path", config.config_path)
     config_table.add_row("Database path", config.db_path)
     config_table.add_row("Obsidian vault", config.obsidian_vault_path)
-    config_table.add_row("Vector index", config.annoy_index_path)
+    config_table.add_row("Vector index", f"{config.annoy_index_path}{legacy_index_note}")
+    config_table.add_row("Vector index status", index_status)
+    if index_state:
+        config_table.add_row(
+            "Vector index generation",
+            f"{index_state.get('built_generation')} of {index_state.get('current_generation')}",
+        )
+        config_table.add_row(
+            "Vector index items",
+            f"{index_state.get('indexed_count') or 0} indexed / "
+            f"{index_state.get('annoy_n_items') or 0} slots",
+        )
     config_table.add_row("Vector index size", vector_index_size_human)
     config_table.add_row(
         "OpenRouter API", 

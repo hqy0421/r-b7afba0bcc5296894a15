@@ -1,4 +1,3 @@
-import os
 import json
 import time
 from typing import List, Dict, Any, Optional, Tuple, Callable, Union
@@ -16,6 +15,7 @@ from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeEl
 from .config import Config
 from .models import Article, Feed
 from .rss import process_all_feeds
+from .vector_index import VectorIndexManager, ensure_schema
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -40,14 +40,37 @@ class RSSProcessor:
         self.db_session = db_session
         self._embedding_model = None
         self._vector_index = None
+        self._vector_index_key = None
+        self._index_manager = None
+        self._db_uuid = None
+        # Make sure the generation schema/triggers exist before any read.  This
+        # is idempotent and cheap once installed (PRAGMA + trigger inspection).
+        try:
+            engine = db_session.get_bind()
+            self._index_manager = VectorIndexManager(engine, config)
+            ensure_schema(engine)
+        except Exception as exc:
+            logger.warning(f"Vector index schema unavailable: {exc}")
 
     @property
     def embedding_model(self):
         """Lazy load the embedding model."""
         if self._embedding_model is None:
             logger.info("Loading embedding model...")
-            self._embedding_model = SentenceTransformer('all-mpnet-base-v2')
+            self._embedding_model = SentenceTransformer(self.config.embedding_model_name)
         return self._embedding_model
+
+    def _get_index_manager(self) -> Optional[VectorIndexManager]:
+        """Return the vector index manager, installing the schema if needed."""
+        if self._index_manager is None:
+            try:
+                engine = self.db_session.get_bind()
+                ensure_schema(engine)
+                self._index_manager = VectorIndexManager(engine, self.config)
+            except Exception as exc:
+                logger.warning(f"Vector index schema unavailable: {exc}")
+                return None
+        return self._index_manager
 
     def ingest_feeds(self, lookback_days: Optional[int] = None, debug: bool = False) -> Dict[str, int]:
         """
@@ -380,7 +403,7 @@ class RSSProcessor:
 
     def _store_embedding(self, article_id: int, embedding: List[float]) -> None:
         """
-        Store an embedding vector in the Annoy index.
+        Buffer an embedding vector for the next index rebuild.
 
         Args:
             article_id: ID of the article
@@ -391,72 +414,166 @@ class RSSProcessor:
             self._pending_embeddings = {}
         self._pending_embeddings[article_id] = embedding
 
-    def _flush_embeddings(self) -> int:
+    def _persist_pending_embeddings(self) -> int:
         """
-        Rebuild the Annoy index from all embedding vectors stored in the database.
-
-        Annoy indices are immutable after build(), so we must rebuild from scratch
-        whenever new embeddings are added. Embedding vectors are persisted in the
-        Article.embedding_vector column so rebuilds don't require re-computation.
+        Persist buffered vectors to the database without rebuilding the index.
 
         Returns:
-            Number of new embeddings added in this batch
+            Number of buffered vectors persisted
         """
         pending = getattr(self, '_pending_embeddings', {})
         if not pending:
             return 0
 
-        # Persist pending vectors to the database
         for article_id, embedding in pending.items():
             article = self.db_session.query(Article).filter_by(id=article_id).first()
             if article:
                 article.embedding_vector = json.dumps(embedding)
         self.db_session.commit()
-
-        # Rebuild the full index from all stored vectors
-        embedding_dim = 768  # all-mpnet-base-v2 dimension
-        new_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
-
-        articles_with_vectors = self.db_session.query(Article).filter(
-            Article.embedding_generated == True,
-            Article.embedding_vector.isnot(None)
-        ).all()
-
-        indexed = 0
-        for article in articles_with_vectors:
-            try:
-                vector = json.loads(article.embedding_vector)
-                new_index.add_item(article.id, vector)
-                indexed += 1
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.warning(f"Skipping article {article.id}: bad embedding vector: {e}")
-
-        if indexed > 0:
-            new_index.build(self.config.annoy_n_trees)
-            new_index.save(self.config.annoy_index_path)
-            logger.info(f"Rebuilt vector index with {indexed} embeddings ({len(pending)} new)")
-
-        # Clear state for next batch
-        self._vector_index = None  # Lazy-reload on next search
-        self._pending_embeddings = {}
-
         return len(pending)
 
-    def _load_or_create_index(self) -> None:
-        """Load the existing Annoy index or create a new one."""
-        embedding_dim = 768  # all-mpnet-base-v2 dimension
+    def _flush_embeddings(self) -> int:
+        """
+        Persist buffered vectors and publish a new, generation-consistent index.
 
-        self._vector_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+        Annoy indices are immutable after build(), so the index is rebuilt from
+        the vectors stored in the database.  The published index is tagged with
+        the database generation it was built from; readers never use it if the
+        database has since changed.
 
-        # Try to load existing index
-        if os.path.exists(self.config.annoy_index_path):
+        Returns:
+            Number of new embeddings added in this batch
+        """
+        persisted = self._persist_pending_embeddings()
+        if persisted == 0:
+            # Nothing new: leave any existing valid index untouched.
+            return 0
+
+        self._publish_index("flush")
+
+        # Clear buffer and force a validated reload on the next search.
+        self._pending_embeddings = {}
+        self._invalidate_vector_index_cache()
+        return persisted
+
+    def _invalidate_vector_index_cache(self) -> None:
+        """Drop the in-memory loaded index."""
+        if self._vector_index is not None:
             try:
-                self._vector_index.load(self.config.annoy_index_path)
-                logger.info(f"Loaded existing vector index from {self.config.annoy_index_path}")
-            except Exception as e:
-                logger.error(f"Failed to load vector index: {str(e)}")
-                # Create a new index
-                self._vector_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+                self._vector_index.unload()
+            except Exception:
+                pass
+        self._vector_index = None
+        self._vector_index_key = None
+
+    def _publish_index(self, reason: str = "rebuild") -> Dict[str, Any]:
+        """Rebuild and publish the vector index; returns publish statistics."""
+        manager = self._get_index_manager()
+        if manager is None:
+            return {"published": False, "reason": "schema_missing", "indexed": 0}
+        # Repair triggers/schema if an external tool dropped them.
+        try:
+            ensure_schema(self.db_session.get_bind())
+        except Exception as exc:
+            logger.warning(f"Could not repair vector index schema: {exc}")
+        result = manager.publish()
+        if reason:
+            result["trigger"] = reason
+        return result
+
+    def rebuild_index(self) -> Dict[str, Any]:
+        """
+        Persist buffered embeddings and rebuild/publicise the vector index.
+
+        Safe to call after external changes (deletions, restored backups, or
+        legacy indexes): it rebuilds from the vectors currently stored in the
+        database and publishes a generation-consistent index.
+
+        Returns:
+            Dictionary with publish statistics
+        """
+        persisted = self._persist_pending_embeddings()
+        result = self._publish_index("rebuild")
+        result["persisted"] = persisted
+        self._invalidate_vector_index_cache()
+        return result
+
+    def ensure_index_current(self) -> Dict[str, Any]:
+        """
+        Rebuild the index only if it is missing or out of sync with the database.
+
+        This does not load the embedding model; it rebuilds from vectors already
+        stored in the database.
+        """
+        manager = self._get_index_manager()
+        if manager is None:
+            return {"rebuilt": False, "reason": "schema_missing"}
+
+        state = manager.read_state()
+        if manager.is_current(state):
+            return {"rebuilt": False, "reason": "current"}
+
+        # Nothing indexable: publish a committed empty index so any stale file
+        # is never served.
+        if (state.get("current_count") if state else 0) == 0:
+            result = self._publish_index("empty")
+            return {"rebuilt": result.get("published", False), "reason": "empty", **result}
+
+        result = self._publish_index("stale")
+        result["rebuilt"] = result.get("published", False)
+        return result
+
+    def _get_vector_index(self) -> Optional[AnnoyIndex]:
+        """
+        Return a validated vector index matching the current database, or None.
+
+        The metadata is re-read on every call so long-lived processes pick up
+        newly published generations.  A stale/unconfirmed/mismatched index is
+        never returned.
+        """
+        manager = self._get_index_manager()
+        if manager is None:
+            return None
+
+        state = manager.read_state()
+        if state is None:
+            self._invalidate_vector_index_cache()
+            return None
+
+        db_uuid = state.get("db_uuid")
+        if self._db_uuid is None:
+            self._db_uuid = db_uuid
+        elif db_uuid != self._db_uuid:
+            logger.warning(
+                "Database identity changed (restored/replaced); refusing to serve "
+                "the vector index. Restart the process or run 'rssidian rebuild-index'."
+            )
+            self._db_uuid = db_uuid
+            self._invalidate_vector_index_cache()
+            return None
+
+        key = (db_uuid, state.get("built_generation"), state.get("index_filename"))
+        if self._vector_index is not None and self._vector_index_key == key:
+            # Still re-validate the cached index against the current database
+            # before serving it.
+            if manager.is_current(state):
+                return self._vector_index
+            self._invalidate_vector_index_cache()
+            return None
+
+        index, reason, _ = manager.load_validated(expected_uuid=self._db_uuid)
+        if index is None:
+            if reason not in (None, "uninitialized"):
+                logger.warning(
+                    "Vector index unavailable (%s); run 'rssidian rebuild-index'.",
+                    reason,
+                )
+            self._invalidate_vector_index_cache()
+            return None
+
+        self._vector_index = index
+        self._vector_index_key = key
+        return index
 
     def find_similar_articles(self, article: Article, similarity_threshold: float = None) -> List[Article]:
         """
@@ -492,6 +609,11 @@ class RSSProcessor:
 
     def _find_content_similar_articles(self, article: Article, threshold: float) -> List[Article]:
         """Find articles similar by content using embeddings."""
+        # Only use an index that is consistent with the current database.
+        vector_index = self._get_vector_index()
+        if vector_index is None:
+            return []
+
         # Generate embedding for the article
         text_to_embed = article.content
         if article.summary:
@@ -499,16 +621,9 @@ class RSSProcessor:
 
         query_embedding = self._generate_embedding(text_to_embed)
 
-        # Load index if needed
-        if self._vector_index is None:
-            self._load_or_create_index()
-
-        if self._vector_index is None:
-            return []
-
         try:
             # Search for similar articles
-            similar_ids, distances = self._vector_index.get_nns_by_vector(
+            similar_ids, distances = vector_index.get_nns_by_vector(
                 query_embedding,
                 20,  # Get up to 20 candidates
                 include_distances=True
@@ -938,20 +1053,25 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         Returns:
             List of search results
         """
-        # Refresh the index if requested
-        if refresh or self._vector_index is None:
-            self._load_or_create_index()
+        # `refresh` re-validates against the database (bypassing the in-memory
+        # cache); it does not trigger an expensive rebuild.  Use rebuild_index()
+        # for that.  A missing/stale/unconfirmed index yields no results.
+        if refresh:
+            self._invalidate_vector_index_cache()
 
-            # If still none, there are no embeddings yet
-            if self._vector_index is None:
-                logger.warning("No vector index available")
-                return []
+        vector_index = self._get_vector_index()
+        if vector_index is None:
+            logger.warning(
+                "No generation-consistent vector index available; "
+                "run 'rssidian rebuild-index' if this persists."
+            )
+            return []
 
         # Generate query embedding
         query_embedding = self._generate_embedding(query)
 
         # Search for similar articles
-        similar_ids, distances = self._vector_index.get_nns_by_vector(
+        similar_ids, distances = vector_index.get_nns_by_vector(
             query_embedding,
             max_results * 2,  # Get more than we need to filter by relevance
             include_distances=True

@@ -229,7 +229,8 @@ INPUT:
 """
 
 [annoy]
-# Path to vector index file
+# Base path for vector index files. Each published index is written to a
+# generation-addressed file next to this base name (e.g. annoy.<uuid>.g12.<nonce>.idx)
 index_path = "~/.config/rssidian/annoy.idx"
 
 # Number of trees (more = better accuracy but slower build)
@@ -237,6 +238,11 @@ n_trees = 10
 
 # Distance metric (angular = cosine similarity)
 metric = "angular"
+
+# Sentence-transformers model used for embeddings. Changing this (or the
+# dimension below) invalidates the index; run `rssidian rebuild-index`.
+# embedding_model = "all-mpnet-base-v2"
+# embedding_dim = 768
 
 [feeds]
 # Default lookback period (in days) for RSS ingestion

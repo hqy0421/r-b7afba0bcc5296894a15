@@ -148,7 +148,7 @@ value_prompt_enabled = true
 minimum_quality_tier = "B"
 
 [annoy]
-# Path to vector index file
+# Base path for vector index files (each published index is generation-addressed)
 index_path = "~/.config/rssidian/annoy.idx"
 
 # Number of trees (more = better accuracy but slower build)
@@ -156,6 +156,10 @@ n_trees = 10
 
 # Distance metric (angular = cosine similarity)
 metric = "angular"
+
+# Sentence-transformers model and dimension (changing these requires rebuild-index)
+# embedding_model = "all-mpnet-base-v2"
+# embedding_dim = 768
 ```
 
 ## Usage
@@ -195,8 +199,11 @@ rssidian search "impact of blockchain on cybersecurity"
 # Search with custom relevance threshold
 rssidian search "meditation techniques for beginners" --relevance 75
 
-# Force refresh of search index before searching
+# Re-validate the index against the database before searching
 rssidian search "blockchain" --refresh
+
+# Rebuild the vector index after deleting articles or restoring a backup
+rssidian rebuild-index
 
 # Start the MCP (Model Context Protocol) service
 rssidian mcp --port 8080                # Start in HTTP mode on port 8080
@@ -240,10 +247,33 @@ rssidian show-config
 ```
 
 This will display:
-- Vector index location and size
+- Vector index status, generation, item counts, location and size
 - Number of total articles
 - Number of articles with embeddings
 - Other configuration settings
+
+## Vector Index Consistency
+
+The Annoy index is generation-aware. SQLite is the source of truth: database
+triggers bump a generation counter whenever the set of embeddable articles
+changes, and each published index file is tagged with the generation it was
+built from. Search only loads an index whose generation (and content
+fingerprint, model, dimension and metric) still matches the database.
+
+Consequences:
+
+- Deleting or rebuilding articles never leaves search returning stale results —
+  a mismatch fails closed (no results) until the index is rebuilt.
+- A rebuild that writes the index file but cannot confirm it (because the
+  database changed mid-build) is discarded, never served.
+- Missing/tampered triggers are detected and repaired; unknown legacy
+  `annoy.idx` files are ignored.
+- Long-running processes (`mcp --stdio`, API) re-check the generation on every
+  search.
+
+Run `rssidian rebuild-index` after deleting articles, restoring a backup, or
+whenever `show-config` reports the index as stale. `rssidian ingest` and
+`rssidian backfill-embeddings` keep the index current automatically.
 
 ## How It Works
 
